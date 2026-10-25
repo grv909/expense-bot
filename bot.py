@@ -15,6 +15,8 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import gspread
+import calendar
+
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -27,6 +29,8 @@ from msgparser import AMOUNT_RE, ParseError, parse_message
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("expense-bot")
+
+BUDGET_TAB = os.environ.get("BUDGET_TAB", "Budgets")
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_ID = int(os.environ["ALLOWED_USER_ID"])           # only this Telegram user may use the bot
@@ -142,12 +146,20 @@ HELP = (
     "• /month – this month: spent, income, by type, top names\n"
     "• /last 5 – your last 5 entries (default 5)\n"
     "• /types – types you've used, with counts\n\n"
+    "Budget\n"
+    "• /budget Food 3000 – set a monthly limit for a type\n"
+    "• /budget Total 20000 – set an overall monthly limit\n"
+    "• /budget – status of all budgets with progress bars\n"
+    "• /budget Food off – remove a budget\n"
+    "• /left – what's left per budget and the per-day allowance\n"
+    "• /forecast – projected month-end spend at your current pace\n"
+    "• /compare – this month vs last month by type\n"
+    "• Warnings appear automatically after you log an entry that reaches 80% or goes over a budget.\n\n"
     "Fix\n"
     "• /undo – delete the last entry\n"
     "• /cancel – stop a guided /add\n\n"
     "Types 'income' and 'transfer' (or i / t) aren't counted as spending."
 )
-
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not authorised(update):
@@ -175,6 +187,10 @@ async def save_and_reply(message, amount, name, ttype):
         await message.reply_text("❌ Couldn't write to the sheet. Try again in a moment.")
         return False
     await message.reply_text(f"✅ {ttype}: {rupees(amount)} – {name} ({d})")
+    await message.reply_text(f"✅ {ttype}: {rupees(amount)} – {name} ({d})")
+    note = budget_alert(ttype, amount)
+    if note:
+        await message.reply_text(note)
     return True
 
 
@@ -386,6 +402,201 @@ def keep_awake(url, every=600):
     threading.Thread(target=loop, daemon=True).start()
 
 
+# ===================== BUDGET ADD-ON (paste into bot.py, above "# ---- wiring") =====================
+
+
+
+def _now():
+    return datetime.now(TZ)
+
+
+def budget_ws():
+    """The 'Budgets' tab (Type | Monthly Limit). Created automatically the first time."""
+    ss = sheet().spreadsheet
+    try:
+        return ss.worksheet(BUDGET_TAB)
+    except gspread.WorksheetNotFound:
+        ws = ss.add_worksheet(BUDGET_TAB, rows=100, cols=2)
+        ws.append_row(["Type", "Monthly Limit"])
+        return ws
+
+
+def read_budgets():
+    """{'food': ('Food', 3000.0), 'total': ('Total', 20000.0)}"""
+    out = {}
+    for r in budget_ws().get_all_values(value_render_option="UNFORMATTED_VALUE")[1:]:
+        if len(r) >= 2 and str(r[0]).strip() != "":
+            try:
+                out[str(r[0]).strip().lower()] = (str(r[0]).strip(), float(r[1]))
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def set_budget(btype, limit):
+    """limit=None removes it. Returns 'set' / 'removed' / 'missing'."""
+    ws = budget_ws()
+    values = ws.get_all_values()
+    for i, r in enumerate(values[1:], start=2):
+        if r and r[0].strip().lower() == btype.lower():
+            if limit is None:
+                ws.delete_rows(i)
+                return "removed"
+            ws.update_cell(i, 2, limit)
+            return "set"
+    if limit is None:
+        return "missing"
+    ws.append_row([btype, limit])
+    return "set"
+
+
+def month_spend(month_prefix=None):
+    """({'food': 2100.0, ...}, total) of spending (not Income/Transfer) in a month 'YYYY-MM'."""
+    prefix = month_prefix or _now().strftime("%Y-%m")
+    by_type = defaultdict(float)
+    for d, _, a, t in read_rows():
+        if d.startswith(prefix) and is_spending(t):
+            by_type[t.lower()] += a
+    return dict(by_type), sum(by_type.values())
+
+
+def bar(pct, width=10):
+    filled = max(0, min(width, round(pct * width)))
+    return "▓" * filled + "░" * (width - filled)
+
+
+def spent_for(key, by_type, total):
+    return total if key == "total" else by_type.get(key, 0.0)
+
+
+def budget_alert(ttype, amount):
+    """Warning text after saving an entry, or ''. Never raises."""
+    try:
+        if not is_spending(ttype):
+            return ""
+        budgets = read_budgets()
+        if not budgets:
+            return ""
+        by_type, total = month_spend()
+        notes = []
+        for key in (ttype.lower(), "total"):
+            if key not in budgets:
+                continue
+            label, limit = budgets[key]
+            if limit <= 0:
+                continue
+            spent = spent_for(key, by_type, total)
+            pct, before = spent / limit, (spent - amount) / limit
+            if pct >= 1:
+                notes.append(f"🚨 Over {label} budget by {rupees(spent - limit)} ({rupees(spent)} of {rupees(limit)})")
+            elif pct >= 0.8 > before:
+                notes.append(f"⚠️ {pct:.0%} of {label} budget used – {rupees(limit - spent)} left")
+        return "\n".join(notes)
+    except Exception:
+        log.exception("budget alert failed")
+        return ""
+
+
+async def budget(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    args = ctx.args or []
+    if len(args) >= 2:                                   # /budget Food 3000   |   /budget Food off
+        btype = " ".join(args[:-1]).strip().title()
+        last = args[-1].lower()
+        if last in ("off", "remove", "delete", "none"):
+            res = set_budget(btype, None)
+            await update.message.reply_text(
+                f"🗑 Removed the {btype} budget." if res == "removed" else f"No budget found for {btype}.")
+            return
+        if not AMOUNT_RE.match(args[-1]):
+            await update.message.reply_text("Use:  /budget Food 3000   (or  /budget Food off)")
+            return
+        limit = float(args[-1].replace("₹", "").replace(",", "").replace("+", "").replace("-", ""))
+        if limit <= 0:
+            await update.message.reply_text("Limit must be more than 0. To delete one: /budget Food off")
+            return
+        set_budget(btype, round(limit, 2))
+        await update.message.reply_text(f"✅ {btype} budget set to {rupees(limit)} per month.")
+        return
+    if args:
+        await update.message.reply_text("Use:  /budget Food 3000   (or  /budget Food off,  or just /budget to see status)")
+        return
+
+    budgets = read_budgets()                              # /budget  -> status
+    if not budgets:
+        await update.message.reply_text(
+            "No budgets yet.\nSet one:  /budget Food 3000\nOverall limit:  /budget Total 20000")
+        return
+    by_type, total = month_spend()
+    now = _now()
+    dim = calendar.monthrange(now.year, now.month)[1]
+    lines = [f"📊 Budget – {now:%B %Y} (day {now.day}/{dim})", ""]
+    for key, (label, limit) in sorted(budgets.items(), key=lambda kv: (kv[0] != "total", kv[0])):
+        spent = spent_for(key, by_type, total)
+        pct = spent / limit if limit else 0
+        flag = "🚨" if pct >= 1 else "⚠️" if pct >= 0.8 else "✅"
+        left = f"{rupees(limit - spent)} left" if spent <= limit else f"over by {rupees(spent - limit)}"
+        lines.append(f"{flag} {label}: {rupees(spent)} / {rupees(limit)}  {pct:.0%}\n    {bar(pct)}  {left}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def left(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    budgets = read_budgets()
+    if not budgets:
+        await update.message.reply_text("No budgets yet. Set one:  /budget Food 3000")
+        return
+    by_type, total = month_spend()
+    now = _now()
+    days_left = calendar.monthrange(now.year, now.month)[1] - now.day + 1     # including today
+    lines = [f"💰 Left this month ({days_left} days incl. today)", ""]
+    for key, (label, limit) in sorted(budgets.items(), key=lambda kv: (kv[0] != "total", kv[0])):
+        remaining = limit - spent_for(key, by_type, total)
+        if remaining >= 0:
+            lines.append(f"• {label}: {rupees(remaining)} left  →  {rupees(remaining / days_left)}/day")
+        else:
+            lines.append(f"• {label}: over by {rupees(-remaining)} 🚨")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def forecast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    by_type, total = month_spend()
+    if total == 0:
+        await update.message.reply_text("Nothing spent this month yet.")
+        return
+    now = _now()
+    dim = calendar.monthrange(now.year, now.month)[1]
+    factor = dim / now.day
+    budgets = read_budgets()
+    lines = [f"🔮 Month-end forecast (at the current pace, day {now.day}/{dim})", "",
+             f"Total: {rupees(total)} so far → ~{rupees(total * factor)}"]
+    if "total" in budgets:
+        limit = budgets["total"][1]
+        lines[-1] += f"  (budget {rupees(limit)}) " + ("🚨" if total * factor > limit else "✅")
+    for key, spent in sorted(by_type.items(), key=lambda kv: -kv[1])[:8]:
+        line = f"• {key.title()}: {rupees(spent)} → ~{rupees(spent * factor)}"
+        if key in budgets:
+            line += f"  (budget {rupees(budgets[key][1])}) " + ("🚨" if spent * factor > budgets[key][1] else "✅")
+        lines.append(line)
+    await update.message.reply_text("\n".join(lines))
+
+
+async def compare(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    now = _now()
+    prev_first = (now.replace(day=1) - timedelta(days=1))
+    cur, cur_total = month_spend(now.strftime("%Y-%m"))
+    prev, prev_total = month_spend(prev_first.strftime("%Y-%m"))
+    if not cur and not prev:
+        await update.message.reply_text("No spending in either month.")
+        return
+    lines = [f"📈 {now:%B} vs {prev_first:%B}", "",
+             f"Total: {rupees(cur_total)} vs {rupees(prev_total)}  ({'+' if cur_total >= prev_total else '−'}{rupees(abs(cur_total - prev_total))})"]
+    for key in sorted(set(cur) | set(prev), key=lambda k: -(cur.get(k, 0) + prev.get(k, 0)))[:10]:
+        c, p = cur.get(key, 0.0), prev.get(key, 0.0)
+        lines.append(f"• {key.title()}: {rupees(c)} vs {rupees(p)}  ({'+' if c >= p else '−'}{rupees(abs(c - p))})")
+    lines.append("\n(This month is partial, so compare with the day of the month in mind.)")
+    await update.message.reply_text("\n".join(lines))
+# ===================== END BUDGET ADD-ON =====================
+
+
 # ---------------------------------------------------------------- wiring
 def build_app() -> Application:
     app = Application.builder().token(TOKEN).build()
@@ -406,7 +617,9 @@ def build_app() -> Application:
     )
     app.add_handler(conv)
     for name, fn in (("today", today), ("week", week), ("month", month),
-                     ("last", last), ("types", types), ("undo", undo)):
+                    ("last", last), ("types", types), ("undo", undo),
+                    ("budget", budget), ("left", left),
+                    ("forecast", forecast), ("compare", compare)):
         app.add_handler(CommandHandler(name, fn, filters=me))
     app.add_handler(CommandHandler("cancel", cancel, filters=me))
     app.add_handler(MessageHandler(me & filters.TEXT & ~filters.COMMAND, quick_add))
