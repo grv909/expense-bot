@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import gspread
+import threading, time, urllib.request
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -108,7 +109,7 @@ async def today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Nothing logged today.")
         return
     lines = [f"{n} – {rupees(a)} ({t})" for _, n, a, t in rows]
-    spent = sum(a for _, _, a, t in rows if t == "Expense")
+    spent = sum(a for _, _, a, t in rows if t not in ("Income", "Transfer"))
     await update.message.reply_text("Today:\n" + "\n".join(lines) + f"\n\nExpenses: {rupees(spent)}")
 
 
@@ -122,18 +123,24 @@ async def month(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     totals = defaultdict(float)
     names = defaultdict(float)
+    cats = defaultdict(float)
+    income = transfer = 0.0
     for _, n, a, t in rows:
-        totals[t] += a
-        if t == "Expense":
-            names[n] += a
-    msg = [f"{datetime.now(TZ):%B %Y}"]
-    for t in ("Expense", "Income", "Transfer"):
-        msg.append(f"{t}: {rupees(totals[t])}")
-    msg.append(f"Net (income − expense): {rupees(totals['Income'] - totals['Expense'])}")
-    if names:
-        msg.append("\nTop expenses:")
-        for n, a in sorted(names.items(), key=lambda x: -x[1])[:5]:
-            msg.append(f"• {n}: {rupees(a)}")
+       if t == "Income":
+           income += a
+       elif t == "Transfer":
+           transfer += a
+       else:
+           cats[t] += a
+           names[n] += a
+    spent = sum(cats.values())
+    msg = [f"{datetime.now(TZ):%B %Y}",
+          f"Spent: {rupees(spent)}", f"Income: {rupees(income)}",
+          f"Transfers: {rupees(transfer)}", f"Net: {rupees(income - spent)}"]
+    if cats:
+       msg.append("\nBy type:")
+       for c, a in sorted(cats.items(), key=lambda x: -x[1]):
+           msg.append(f"• {c}: {rupees(a)}")
     await update.message.reply_text("\n".join(msg))
 
 
@@ -150,6 +157,17 @@ async def undo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"↩️ Removed: {last[1]} – {rupees(float(last[2]))} ({last[3]}, {last[0]})")
 
 
+
+def keep_awake(url, every=600):
+    def loop():
+        while True:
+            time.sleep(every)
+            try:
+                urllib.request.urlopen(url, timeout=15)
+            except Exception:
+                pass  # even a 404 counts as traffic
+    threading.Thread(target=loop, daemon=True).start()
+
 def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler(["start", "help"], start))
@@ -162,6 +180,7 @@ def main():
     if base_url:  # webhook mode: works on hosts that sleep when idle (Render, Cloud Run, ...)
         port = int(os.environ.get("PORT", "8080"))
         secret = os.environ.get("WEBHOOK_SECRET", "")
+        keep_awake(base_url)
         app.run_webhook(
             listen="0.0.0.0", port=port, url_path=TOKEN,
             webhook_url=f"{base_url.rstrip('/')}/{TOKEN}",
