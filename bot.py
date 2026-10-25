@@ -26,7 +26,8 @@ ALLOWED_ID = int(os.environ["ALLOWED_USER_ID"])          # only this Telegram us
 SHEET_ID = os.environ["GOOGLE_SHEET_ID"]                  # the long id in the sheet URL
 TAB = os.environ.get("SHEET_TAB", "Transactions")
 TZ = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Kolkata"))
-CREDS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]        # full service-account JSON as one env var
+CREDS_FILE = os.environ.get("GOOGLE_CREDENTIALS_FILE")
+CREDS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")       # full service-account JSON as one env var
 
 _ws = None
 
@@ -35,7 +36,10 @@ def sheet():
     """Lazy-connect to the worksheet (reconnects if needed)."""
     global _ws
     if _ws is None:
-        gc = gspread.service_account_from_dict(json.loads(CREDS_JSON))
+        if CREDS_FILE:
+            gc = gspread.service_account(filename=CREDS_FILE)
+        else:
+            gc = gspread.service_account_from_dict(json.loads(CREDS_JSON))
         _ws = gc.open_by_key(SHEET_ID).worksheet(TAB)
     return _ws
 
