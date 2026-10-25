@@ -187,7 +187,6 @@ async def save_and_reply(message, amount, name, ttype):
         await message.reply_text("❌ Couldn't write to the sheet. Try again in a moment.")
         return False
     await message.reply_text(f"✅ {ttype}: {rupees(amount)} – {name} ({d})")
-    await message.reply_text(f"✅ {ttype}: {rupees(amount)} – {name} ({d})")
     note = budget_alert(ttype, amount)
     if note:
         await message.reply_text(note)
